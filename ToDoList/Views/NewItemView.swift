@@ -1,0 +1,522 @@
+//
+//  NewItemView.swift
+//  ToDoList
+//
+//  Created by Adrian Leventiu on 10.08.2023.
+//  Updated with age-based location gating.
+//
+
+import SwiftUI
+import MapKit
+
+struct NewItemView: View {
+    @StateObject var viewModel = NewItemViewViewModel()
+    @Binding var newItemPresented: Bool
+
+    var existingTags: [String]
+    var tagColorMap: [String: Int]
+
+    @State private var selectedLocation: CLLocationCoordinate2D?
+    @State private var isMapVisible: Bool = false
+    @State private var showsUserLocation: Bool = false
+    @State private var nearestAttraction: String?
+    @State private var isWalking: Bool = true
+
+    @State private var mapView: MKMapView?
+
+    @State private var searchText: String = ""
+    @State private var searchResults: [MKMapItem] = []
+    @State private var isSearching: Bool = false
+    @State private var showSearchResults: Bool = false
+
+    @State private var selectedTag: String = "Work"
+    @State private var showCustomTagSheet: Bool = false
+    @State private var newTagName: String = ""
+    @State private var newTagColor: Color = .blue
+
+    private let defaultTags = ["Work", "School", "Family", "Personal"]
+    @State private var tags: [String] = []
+    @State private var tagColors: [String: Color] = [:]
+
+    private let colorOptions: [Color] = [
+        .blue, .red, .green, .purple, .orange,
+        .pink, .yellow, .indigo, .cyan, .brown
+    ]
+
+    @State private var tagColorIndex: Int = 0
+    @State private var shouldCenterMap: Bool = false
+
+    private var pins: [MKPointAnnotation] {
+        if let location = selectedLocation {
+            let pin = MKPointAnnotation()
+            pin.coordinate = location
+            pin.title = "Selected Location"
+            return [pin]
+        }
+        return []
+    }
+
+    init(newItemPresented: Binding<Bool>, existingTags: [String] = [], tagColorMap: [String: Int] = [:]) {
+        self._newItemPresented = newItemPresented
+        self.existingTags = existingTags
+        self.tagColorMap = tagColorMap
+    }
+
+    var body: some View {
+        VStack {
+            Text("New Item")
+                .font(.system(size: 32))
+                .bold()
+                .padding(.top, 30)
+
+            Form {
+                TextField("Title", text: $viewModel.title)
+                    .textFieldStyle(DefaultTextFieldStyle())
+
+                DatePicker("Due Date", selection: $viewModel.dueDate)
+                    .datePickerStyle(GraphicalDatePickerStyle())
+
+                // Tags section
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack {
+                        ForEach(tags, id: \.self) { tag in
+                            let tagColor = tagColors[tag, default: .gray]
+                            Text(tag)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(selectedTag == tag ? tagColor : Color.gray.opacity(0.3))
+                                .cornerRadius(8)
+                                .foregroundColor(.primary)
+                                .onTapGesture {
+                                    viewModel.selectedTag = tag
+                                    if let colorIndex = colorOptions.firstIndex(of: tagColor) {
+                                        viewModel.tagColorIndex = colorIndex
+                                    }
+                                    selectedTag = tag
+                                }
+                        }
+
+                        Button(action: { showCustomTagSheet = true }) {
+                            Image(systemName: "plus")
+                                .foregroundColor(.primary)
+                                .padding(5)
+                                .background(Color.gray.opacity(0.5))
+                                .cornerRadius(8)
+                        }
+                    }
+                    .padding(.vertical, 5)
+                }
+                .listRowSeparator(.hidden)
+                .frame(height: 40)
+                .sheet(isPresented: $showCustomTagSheet) {
+                    Form {
+                        Section(header: Text("Create Custom Tag")) {
+                            TextField("Tag Name", text: $newTagName)
+                                .autocorrectionDisabled()
+                        }
+
+                        Section(header: Text("Choose a Color")) {
+                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 60))], spacing: 15) {
+                                ForEach(colorOptions, id: \.self) { color in
+                                    ZStack {
+                                        Circle().fill(color).frame(width: 50, height: 50)
+                                        if newTagColor == color {
+                                            Circle().stroke(Color.primary, lineWidth: 1).frame(width: 50, height: 50)
+                                        }
+                                    }
+                                    .onTapGesture { newTagColor = color }
+                                }
+                            }
+                            .padding(.vertical)
+                        }
+
+                        Section {
+                            TLButton(title: "Add Tag", background: newTagName.isEmpty ? .gray : .appColor) {
+                                if !newTagName.isEmpty {
+                                    tags.append(newTagName)
+                                    tagColors[newTagName] = newTagColor
+                                    if let colorIndex = colorOptions.firstIndex(of: newTagColor) {
+                                        tagColorIndex = colorIndex
+                                        viewModel.selectedTag = newTagName
+                                        viewModel.tagColorIndex = colorIndex
+                                    }
+                                    selectedTag = newTagName
+                                    showCustomTagSheet = false
+                                    newTagName = ""
+                                    newTagColor = .blue
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .disabled(newTagName.isEmpty)
+                        }
+                        .listRowBackground(Color.clear)
+                    }
+                    .presentationDetents([.medium])
+                    .presentationDragIndicator(.visible)
+                }
+
+                // ── Location section — adults only ──────────────────────────
+                if viewModel.isAdult {
+                    Button(action: {
+                        withAnimation {
+                            isMapVisible.toggle()
+                            showsUserLocation = isMapVisible
+                            if !isMapVisible { showSearchResults = false }
+                        }
+                    }) {
+                        HStack {
+                            Image(systemName: "mappin.and.ellipse").foregroundColor(.red)
+                            Text("Location").font(.headline)
+                            Spacer()
+                            if let attraction = nearestAttraction, !attraction.isEmpty {
+                                Text(attraction)
+                                    .font(.caption)
+                                    .foregroundColor(.gray)
+                                    .lineLimit(1)
+                            }
+                            Image(systemName: isMapVisible ? "chevron.up" : "chevron.down")
+                                .foregroundColor(.gray)
+                        }
+                    }
+                    .listRowSeparator(.hidden)
+
+                    if isMapVisible {
+                        ZStack(alignment: .top) {
+                            MapView(
+                                mapType: .standard,
+                                animated: true,
+                                altitude: 1500,
+                                currentPin: selectedLocation.map { coord -> MKPointAnnotation in
+                                    let pin = MKPointAnnotation()
+                                    pin.coordinate = coord
+                                    pin.title = "Selected Location"
+                                    return pin
+                                },
+                                startLocation: selectedLocation,
+                                showsUserLocation: showsUserLocation
+                            ) { coordinate in
+                                selectedLocation = coordinate
+                                viewModel.latitude = coordinate.latitude
+                                viewModel.longitude = coordinate.longitude
+                                updateNearestLocation()
+                                viewModel.locationDescription = nearestAttraction.map { "near \($0)" } ?? "no location information"
+                            } onPinAdded: { coordinate in
+                                selectedLocation = coordinate
+                                viewModel.latitude = coordinate.latitude
+                                viewModel.longitude = coordinate.longitude
+                                updateNearestLocation()
+                                viewModel.locationDescription = nearestAttraction.map { "near \($0)" } ?? "no location information"
+                            }
+                            .frame(height: 350)
+                            .cornerRadius(12)
+                            .shadow(radius: 2)
+                            .transition(.opacity)
+                            .onChange(of: shouldCenterMap) { _ in
+                                if shouldCenterMap { shouldCenterMap = false }
+                            }
+                            .offset(y: 0)
+
+                            // Search bar overlay
+                            VStack(spacing: 0) {
+                                VStack(spacing: 0) {
+                                    HStack {
+                                        Image(systemName: "magnifyingglass").foregroundColor(.gray).padding(10)
+                                        TextField("Search for location", text: $searchText)
+                                            .autocorrectionDisabled()
+                                            .onSubmit { searchLocation() }
+                                            .onChange(of: searchText) { newText in
+                                                if newText.isEmpty {
+                                                    searchResults = []
+                                                    showSearchResults = false
+                                                } else if newText.count >= 2 {
+                                                    searchLocation()
+                                                }
+                                            }
+                                        if !searchText.isEmpty {
+                                            Button(action: {
+                                                searchText = ""
+                                                searchResults = []
+                                                showSearchResults = false
+                                            }) {
+                                                Image(systemName: "xmark.circle").foregroundColor(.gray).padding(10)
+                                            }
+                                        }
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 8)
+
+                                    if showSearchResults && !searchResults.isEmpty {
+                                        Divider()
+                                        if searchResults.count <= 3 {
+                                            ForEach(searchResults, id: \.self) { item in
+                                                SearchResultRowTransparent(item: item) { selectSearchResult(item) }
+                                                    .frame(minHeight: 60)
+                                                if item != searchResults.last { Divider() }
+                                            }
+                                        } else {
+                                            ScrollView {
+                                                VStack(spacing: 0) {
+                                                    ForEach(searchResults, id: \.self) { item in
+                                                        SearchResultRowTransparent(item: item) { selectSearchResult(item) }
+                                                            .frame(minHeight: 60)
+                                                        if item != searchResults.last { Divider() }
+                                                    }
+                                                }
+                                            }
+                                            .frame(maxHeight: 200)
+                                        }
+                                    }
+                                }
+                                .background(Color(.systemBackground).opacity(0.9))
+                                .cornerRadius(8)
+                                .shadow(radius: 1)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.top, 10)
+                        }
+                        .padding(.vertical, 8)
+                        .listRowSeparator(.hidden)
+
+                        if let location = nearestAttraction {
+                            HStack {
+                                Image(systemName: "mappin").foregroundColor(.red)
+                                Text(location).font(.subheadline).foregroundColor(.gray)
+                            }
+                            .padding(.vertical, 4)
+                            .listRowSeparator(.hidden)
+                        }
+
+                        Toggle(isOn: $isWalking) {
+                            Text(isWalking ? "Getting there: by foot" : "Getting there: by car")
+                                .font(.headline)
+                        }
+                        .toggleStyle(ToggleButton())
+                        .onChange(of: isWalking) { newValue in
+                            viewModel.gettingThere = newValue ? 0 : 1
+                        }
+                        .listRowSeparator(.hidden)
+                    }
+                }
+                // ── End location section ─────────────────────────────────────
+
+                TLButton(title: "Add", background: .appColor) {
+                    if viewModel.canSave {
+                        viewModel.save()
+                        newItemPresented = false
+                    } else {
+                        viewModel.showAlert = true
+                    }
+                }
+            }
+            .alert(isPresented: $viewModel.showAlert) {
+                Alert(
+                    title: Text("Error"),
+                    message: Text("Please ensure all fields are filled and the due date is later than today.")
+                )
+            }
+        }
+        .onAppear {
+            setupTagsAndColors()
+
+            if let userLocation = CLLocationManager().location?.coordinate {
+                selectedLocation = userLocation
+                viewModel.latitude = userLocation.latitude
+                viewModel.longitude = userLocation.longitude
+                updateNearestLocation()
+
+                getNearestLocation(from: userLocation) { attractionName in
+                    nearestAttraction = attractionName
+                    viewModel.locationDescription = nearestAttraction.map { "near \($0)" } ?? "no location information"
+                }
+            } else {
+                viewModel.locationDescription = "no location information"
+                viewModel.latitude = 0
+                viewModel.longitude = 0
+            }
+            isWalking = viewModel.gettingThere == 0
+        }
+        .onChange(of: viewModel.gettingThere) { newValue in
+            isWalking = newValue == 0
+        }
+    }
+
+    // MARK: - Private helpers
+
+    private func searchLocation() {
+        guard !searchText.isEmpty else { return }
+        isSearching = true
+        let searchRequest = MKLocalSearch.Request()
+        searchRequest.naturalLanguageQuery = searchText
+        MKLocalSearch(request: searchRequest).start { response, error in
+            isSearching = false
+            if let error = error {
+                print("Error searching for locations: \(error.localizedDescription)")
+                return
+            }
+            if let response = response {
+                searchResults = response.mapItems
+                showSearchResults = !searchResults.isEmpty
+            }
+        }
+    }
+
+    private func selectSearchResult(_ mapItem: MKMapItem) {
+        let coordinate = mapItem.placemark.coordinate
+        selectedLocation = coordinate
+        viewModel.latitude = coordinate.latitude
+        viewModel.longitude = coordinate.longitude
+
+        getNearestLocation(from: coordinate) { attractionName in
+            nearestAttraction = attractionName
+            viewModel.locationDescription = nearestAttraction.map { "near \($0)" } ?? "no location information"
+        }
+
+        searchText = ""
+        showSearchResults = false
+        withAnimation {
+            isMapVisible = true
+            showsUserLocation = true
+            shouldCenterMap = true
+        }
+    }
+
+    private func setupTagsAndColors() {
+        var allTags = defaultTags
+        var allTagColors: [String: Color] = [
+            "Work": .blue, "School": .green, "Family": .red, "Personal": .purple
+        ]
+
+        for tag in existingTags where !allTags.contains(tag) {
+            allTags.append(tag)
+            if let colorIndex = tagColorMap[tag], colorIndex >= 0, colorIndex < colorOptions.count {
+                allTagColors[tag] = colorOptions[colorIndex]
+            } else {
+                allTagColors[tag] = .blue
+            }
+        }
+
+        self.tags = allTags
+        self.tagColors = allTagColors
+
+        if let first = allTags.first {
+            self.selectedTag = first
+            self.viewModel.selectedTag = first
+            if let color = allTagColors[first], let idx = colorOptions.firstIndex(of: color) {
+                self.viewModel.tagColorIndex = idx
+            }
+        }
+    }
+
+    private func updateNearestLocation() {
+        if let lat = viewModel.latitude, let lon = viewModel.longitude, lat != 0, lon != 0 {
+            getNearestLocation(from: CLLocationCoordinate2D(latitude: lat, longitude: lon)) { attractionName in
+                nearestAttraction = attractionName
+            }
+        } else {
+            nearestAttraction = nil
+        }
+    }
+
+    private func getNearestLocation(from location: CLLocationCoordinate2D, completion: @escaping (String?) -> Void) {
+        let geocoder = CLGeocoder()
+        let clLocation = CLLocation(latitude: location.latitude, longitude: location.longitude)
+
+        geocoder.reverseGeocodeLocation(clLocation) { placemarks, _ in
+            if let placemark = placemarks?.first {
+                var components: [String] = []
+                if let poi = placemark.name, !poi.isEmpty, !poi.contains(where: { $0.isNumber }) {
+                    components.append(poi)
+                }
+                if let neighborhood = placemark.subLocality, !neighborhood.isEmpty {
+                    components.append(neighborhood)
+                }
+                if let city = placemark.locality, !city.isEmpty {
+                    components.append(city)
+                }
+                if components.count >= 1, components.contains(where: { $0 == placemark.locality }) {
+                    completion(components.joined(separator: ", "))
+                    return
+                }
+            }
+
+            let request = MKLocalSearch.Request()
+            request.pointOfInterestFilter = .includingAll
+            request.region = MKCoordinateRegion(center: location, latitudinalMeters: 1000, longitudinalMeters: 1000)
+
+            MKLocalSearch(request: request).start { response, error in
+                if let error = error {
+                    completion(placemarks?.first?.locality)
+                    return
+                }
+                guard let mapItems = response?.mapItems, !mapItems.isEmpty else {
+                    completion(nil)
+                    return
+                }
+
+                let sorted = mapItems.sorted {
+                    CLLocation(latitude: $0.placemark.coordinate.latitude, longitude: $0.placemark.coordinate.longitude)
+                        .distance(from: clLocation)
+                    < CLLocation(latitude: $1.placemark.coordinate.latitude, longitude: $1.placemark.coordinate.longitude)
+                        .distance(from: clLocation)
+                }
+
+                for item in sorted {
+                    if let name = item.name, !name.isEmpty, !name.contains(where: { $0.isNumber }) {
+                        let city = item.placemark.locality ?? ""
+                        completion(city.isEmpty ? name : "\(name), \(city)")
+                        return
+                    }
+                }
+
+                var components: [String] = []
+                if let n = sorted.first?.placemark.subLocality { components.append(n) }
+                if let c = sorted.first?.placemark.locality { components.append(c) }
+                let result = components.joined(separator: ", ")
+                completion(result.isEmpty ? nil : result)
+            }
+        }
+    }
+}
+
+// MARK: - SearchResultRowTransparent
+
+struct SearchResultRowTransparent: View {
+    let item: MKMapItem
+    let onTap: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(item.name ?? "Unknown location")
+                    .font(.headline)
+                    .foregroundColor(.primary)
+
+                HStack(spacing: 4) {
+                    if let thoroughfare = item.placemark.thoroughfare {
+                        Text(thoroughfare).font(.subheadline).foregroundColor(.gray)
+                    }
+                    if let locality = item.placemark.locality {
+                        Text(item.placemark.thoroughfare != nil ? ", \(locality)" : locality)
+                            .font(.subheadline).foregroundColor(.gray)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+        }
+        .contentShape(Rectangle())
+    }
+}
+
+// MARK: - Preview
+
+struct NewItemView_Previews: PreviewProvider {
+    static var previews: some View {
+        NewItemView(
+            newItemPresented: .constant(true),
+            existingTags: ["Work", "Project X", "Deadline"],
+            tagColorMap: ["Work": 0, "Project X": 2, "Deadline": 1]
+        )
+    }
+}
